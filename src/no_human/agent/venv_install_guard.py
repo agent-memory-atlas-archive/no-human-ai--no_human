@@ -114,11 +114,35 @@ pre-execution. It cannot see:
     inherited value as authoritative denied ordinary, safe commands
     (``uv sync``, ``uv run pytest -q``) in every session, so this module
     only trusts a COMMAND-LEVEL ``VIRTUAL_ENV=…`` assignment (see item 4
-    above). Closing this gap without reintroducing that false-positive
-    needs the session's environment scoped BEFORE the command runs
-    (``VIRTUAL_ENV``/``UV_PROJECT_ENVIRONMENT`` pinned to the worktree's
-    own venv for the whole session) — capability-level, not a pattern this
-    module could add.
+    above).
+
+    **NARROWED 2026-09-09 (#128, coder half).** ``--active`` is now caught,
+    because it is a COMMAND-LEVEL statement of intent to use the inherited
+    value, which is the same class of signal as the assignment above rather
+    than the "solely inherited" case this paragraph is about. It is worth
+    catching on its own: ``uv run`` SYNCS the project into its target
+    environment before running anything, so ``uv run --active ruff check .``
+    carries no install word and still rewrote the shared venv's editable path
+    in the incident that raised #128. Plain ``uv run`` is untouched, and is in
+    fact already correct: measured, it leaves the shared venv alone and builds
+    the worktree's own ``.venv``.
+
+    **STILL OPEN.** A command that relies solely on the inherited value with
+    no ``--active`` and no assignment (bare ``uv pip install foo`` with a
+    ``PATH`` that does not itself resolve to the shared venv) is still not
+    caught, for the false-positive reason above. So is
+    ``uv run --python <shared>/bin/python …``: ``--python`` is already in
+    `_TARGET_FLAGS`, so it would be caught the moment ``run`` counted as a
+    mutating subcommand, but making ``run`` mutating in general puts every
+    ordinary ``uv run pytest -q`` through target resolution, which is the
+    broad reading this register warns about. Closing the remainder still
+    wants the session's environment scoped BEFORE the command runs
+    (``VIRTUAL_ENV``/``UV_PROJECT_ENVIRONMENT`` pinned to the worktree's own
+    venv for the whole session) — capability-level. Note that pinning alone
+    would ALSO not be enough: pip reads neither variable and follows ``PATH``
+    (measured on PR #145), and a session pinned to an EMPTY worktree venv
+    would break ``uv run pytest`` for every task, which is the cost that
+    keeps this at the capability level rather than the environment level.
 
 None of these can be closed by adding a smarter pattern — the information
 needed does not exist before the command runs. The real fix for this
@@ -185,6 +209,31 @@ _TARGET_FLAGS = frozenset({
 _VALUE_FLAGS = _TARGET_FLAGS
 
 _ENV_VARS = ("VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT")
+
+#: uv's opt-in to the ALREADY-ACTIVE environment, i.e. the inherited
+#: ``VIRTUAL_ENV``, in place of the project's own ``.venv``.
+#:
+#: This is the one flag that makes an inherited value authoritative, and it is
+#: why the residual register's "relies SOLELY on an inherited VIRTUAL_ENV"
+#: exclusion does not cover it: ``--active`` is a COMMAND-LEVEL statement of
+#: intent, exactly the class of signal this module already trusts in a
+#: ``VIRTUAL_ENV=<path> pip install`` assignment. Trusting it here therefore
+#: does not reintroduce the false positives that shaped the current design;
+#: plain ``uv run``, ``uv sync`` and ``uv run pytest -q`` are untouched.
+#:
+#: It matters because ``uv run`` SYNCS the project into its target environment
+#: before running anything, so the command need not be install-shaped to
+#: rewrite a venv. Measured on 2026-09-09 in a throwaway repo, from inside a
+#: linked worktree with ``VIRTUAL_ENV`` naming the primary checkout's venv::
+#:
+#:     uv run --active python -c "print('ran')"
+#:     -> "Uninstalled 1 package / Installed 1 package"
+#:     -> the SHARED venv's .pth moved from <primary>/src to <worktree>/src
+#:
+#: and the control, the same command without ``--active``, left the shared
+#: venv untouched and built the worktree's own ``.venv`` instead. That is the
+#: coder-session half of issue #128.
+_ACTIVE_FLAG = "--active"
 
 _UNRESOLVABLE_CHARS = ("$", "`")
 
@@ -391,10 +440,157 @@ def _mutating_subcommand(tokens: list[str], start: int) -> str | None:
     return None
 
 
+#: Installer subcommands that go on to invoke another program, so the NEXT
+#: positional is that program's name and flags after it are not the
+#: installer's. Deliberately tiny: every subcommand absent from this set is
+#: treated as invoking nothing, which keeps the walk looking for `--active`
+#: across the whole invocation. Erring that way over-denies; erring the other
+#: way allowed `uv add <pkg> --active`, the #128 mechanism itself.
+#: Flags that NEGATE `--active`: with either of these `uv run` does not sync,
+#: so nothing is written and the flag names an environment it never touches.
+#: Measured against uv 0.12.5 — the shared venv's `.pth` unchanged for both.
+_ACTIVE_NEGATING_FLAGS = frozenset({"--no-sync", "--no-project"})
+
+_PROGRAM_INVOKING_SUBCOMMANDS = frozenset({"run"})
+
+#: Installers whose FIRST positional is already the program (`uvx ruff …`),
+#: with no subcommand in between.
+_PROGRAM_FIRST = frozenset({"uvx"})
+
+
+def _is_active_flag(tok: str) -> bool:
+    """Both spellings of uv's `--active`; it takes no value, so the `=` form
+    is defence against a spelling uv itself rejects rather than a real one."""
+    return tok == _ACTIVE_FLAG or tok.startswith(_ACTIVE_FLAG + "=")
+
+
+def _active_env_installer(
+    tokens: list[str], positions: list[tuple[int, str]],
+) -> int | None:
+    """The index of the resolved installer whose OWN invocation opts into the
+    already-active environment, or None.
+
+    Returns a position rather than a bool because everything downstream must
+    bind to that one invocation: the variable-assignment suppression in
+    `_effective_prefixes` reads this invocation's prefix, and a union over all
+    installers let `VIRTUAL_ENV= uv sync && uv run --active pytest` disarm the
+    denial from a different command entirely.
+
+    Scoped to the invocation, the same walk and stop conditions as
+    `_mutating_subcommand` above, and for the same reason its docstring gives:
+    a flag reaches a process through THAT process's argv. Reading the stream
+    flat instead denied commands that never touch the shared venv, e.g.
+    `grep -- --active notes.txt && uv run pytest -q`.
+
+    `--no-sync` and `--no-project` NEGATE it. `uv run` syncs before running,
+    which is the whole reason `--active` is intent at all; with either of
+    those the sync does not happen and nothing is written — measured against
+    uv 0.12.5, the shared venv's `.pth` unchanged in both cases. They are also
+    the majority spelling in this fleet's own coder traffic, so denying them
+    spends bounded attempts on commands that were always safe.
+    """
+    if not any(_is_active_flag(tok) for tok in tokens):
+        return None  # O(n) pre-filter: the walk below is per-installer.
+    n = len(tokens)
+    for start, _resolved in positions:
+        i = start + 1
+        seen_positional = 0
+        after_unknown_flag = False
+        saw_active = False
+        negated = False
+        program_at = 1 if _basename(tokens[start]) in _PROGRAM_FIRST else None
+        while i < n:
+            tok = tokens[i]
+            if tok in _SEGMENT_BREAKS:
+                # LOAD-BEARING, and the only stop for most invocations: the
+                # positional stop below is armed only for `uv run` and `uvx`,
+                # so for `sync`, `add`, `remove`, `lock`, `export` and
+                # `pip …` THIS is what keeps the walk out of the next
+                # command's argv. Deleting it turns
+                # `uv sync ; grep -- --active notes.txt` into a denial.
+                break
+            if _is_active_flag(tok):
+                saw_active = True
+                i += 1
+                continue
+            if tok in _ACTIVE_NEGATING_FLAGS:
+                negated = True
+                i += 1
+                continue
+            head = tok.split("=", 1)[0]
+            if "=" in tok and head in _ENV_VARS:
+                i += 1
+                continue
+            if tok.startswith("-"):
+                after_unknown_flag = tok not in _VALUE_FLAGS
+                i += 1 if after_unknown_flag else 2
+                continue
+            if _is_installer_name(tok):
+                after_unknown_flag = False
+                i += 1
+                continue
+            if after_unknown_flag:
+                # An unknown flag's value is NOT proof the program name was
+                # reached; guessing that it was allowed
+                # `uv sync --extra dev --active`.
+                after_unknown_flag = False
+                i += 1
+                continue
+            seen_positional += 1
+            if seen_positional == 1 and program_at is None:
+                # The first positional is the subcommand, and only some go on
+                # to invoke a program. `uv add`/`sync`/`remove`/`lock`/
+                # `export` invoke nothing, so every flag is uv's own —
+                # treating their first ARGUMENT as a program name allowed
+                # `uv add <pkg> --active`.
+                if tok in _PROGRAM_INVOKING_SUBCOMMANDS:
+                    program_at = 2
+                i += 1
+                continue
+            if program_at is not None and seen_positional >= program_at:
+                break
+            i += 1
+        if saw_active and not negated:
+            return start
+    return None
+
+
+def _assigned_before(tokens: list[str], start: int) -> set[str]:
+    """Variables assigned in an installer's OWN command prefix.
+
+    A shell assignment binds only to the command it prefixes, so the scan
+    walks BACKWARD from each resolved installer and stops at the first
+    segment break. Scanning the whole flat stream instead let a `VAR=` token
+    anywhere suppress the signal — measured, all four allowed and all four
+    wrong::
+
+        echo VIRTUAL_ENV= && uv run --active pytest -q
+        uv run --active pytest -q VIRTUAL_ENV=
+        grep VIRTUAL_ENV= notes.txt ; uv run --active pytest
+        bash -lc 'echo VIRTUAL_ENV=' ; uv run --active pytest
+
+    `env VIRTUAL_ENV= uv run …` still counts: `env` sits between the
+    assignment and the installer but no segment break does.
+    """
+    found: set[str] = set()
+    i = start - 1
+    while i >= 0:
+        tok = tokens[i]
+        if tok in _SEGMENT_BREAKS:
+            break
+        head = tok.split("=", 1)[0]
+        if "=" in tok and head in _ENV_VARS:
+            found.add(head)
+        i -= 1
+    return found
+
+
 def _effective_prefixes(
     tokens: list[str],
     cwd: str | None,
     installers: list[str],
+    env: Mapping[str, str] | None = None,
+    positions: list[tuple[int, str]] | None = None,
 ) -> set[str]:
     candidates: set[str] = set()
     if cwd:
@@ -419,6 +615,32 @@ def _effective_prefixes(
                 real = _safe_realpath(_join(cwd, tok[len(prefix):]))
                 if real:
                     candidates.add(real)
+
+    # `--active` is the ONE case where the inherited value becomes a signal,
+    # and it does so for the same reason a command-level assignment does: the
+    # command SAYS to use it. Without this the target of `uv run --active` is
+    # unknown to this module and the command reads as harmless, which is the
+    # coder-session half of #128.
+    active_at = _active_env_installer(tokens, positions or [])
+    if env is not None and active_at is not None:
+        # A command-level assignment for the SAME variable wins, because at
+        # runtime it shadows the inherited one — including the empty form.
+        # `VIRTUAL_ENV= uv run --active pytest -q` clears the variable for the
+        # child, so there is no active environment to target and uv falls back
+        # to the project's own; that spelling appears in this fleet's own
+        # history as a coder's workaround, and treating it as if the inherited
+        # value still applied denied a command that is in fact safe. An
+        # assignment with a VALUE is already picked up by the scan above.
+        assigned = _assigned_before(tokens, active_at)
+        for var in _ENV_VARS:
+            if var in assigned:
+                continue
+            value = env.get(var)
+            if not value:
+                continue
+            real = _safe_realpath(_join(cwd, value))
+            if real:
+                candidates.add(real)
 
     # Explicit --target/--prefix/--root/--python/--project/--directory —
     # flag -> value adjacency is the only positional read in this module,
@@ -524,7 +746,17 @@ def denial_reason(cmd: str, *, cwd: str | None, env: Mapping[str, str] | None = 
     # add`) but "does a RESOLVED installer's own adjacent subcommand mutate"
     # — both halves (the executable and the subcommand) are structural, no
     # text pattern is matched against `cmd` for this decision.
-    intent = any(
+    # `--active` is intent on its own, without a mutating SUBCOMMAND, because
+    # `uv run` syncs the project into its target environment before running
+    # whatever it was given: `uv run --active ruff check .` carries no install
+    # word and still rewrites the active venv's editable path (#128). Adding
+    # `run` to `_MUTATING_SUBCOMMANDS` would catch that too, and would also
+    # catch `uv run --python <shared>/bin/python`, but it would put every
+    # ordinary `uv run pytest -q` through the target resolution below, which
+    # is the broad reading this module's residual register warns about. This
+    # is the narrow half: `--active` is rare, explicit, and always names an
+    # environment.
+    intent = _active_env_installer(tokens, resolved_positions) is not None or any(
         _mutating_subcommand(tokens, i) in _MUTATING_SUBCOMMANDS
         for i, _ in resolved_positions
     )
@@ -552,7 +784,8 @@ def denial_reason(cmd: str, *, cwd: str | None, env: Mapping[str, str] | None = 
     if cwd_real is None:
         return f"blocked: session worktree {cwd!r} could not be resolved."
 
-    candidates = _effective_prefixes(tokens, cwd, installers)
+    candidates = _effective_prefixes(
+        tokens, cwd, installers, env, resolved_positions)
     if not candidates:
         return (
             f"blocked: could not resolve where this install would write, "
@@ -565,7 +798,10 @@ def denial_reason(cmd: str, *, cwd: str | None, env: Mapping[str, str] | None = 
         return (
             f"install blocked: resolves to {outside[0]}, outside this "
             f"session's worktree ({cwd_real}) — not the worktree's own "
-            f".venv. Installers must target the worktree's own .venv, e.g. "
+            f".venv. If this is `uv run --active`, drop `--active`: plain "
+            f"`uv run` already targets the worktree's own environment and "
+            f"builds it when absent, which is what you want here. Otherwise "
+            f"installers must target the worktree's own .venv, e.g. "
             f"`{alt} -m pip install ...` or `uv sync` with no --python/"
             f"--target/--prefix/--project pointing elsewhere."
         )

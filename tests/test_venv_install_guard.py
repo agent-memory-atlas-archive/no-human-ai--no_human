@@ -547,3 +547,380 @@ def test_evaluate_env_defaults_to_os_environ_when_omitted(tmp_path, monkeypatch)
     d = guard.evaluate("Bash", {"command": "git status"}, forbidden_paths=FORBIDDEN,
                         never_push_to=PROTECTED, cwd=tmp)
     assert d.allow
+
+
+# --------------------------------------------------------------------------- #
+# `--active`: the coder-session half of #128.
+#
+# `uv run` SYNCS the project into its target environment before running
+# anything, so the command need not be install-shaped to rewrite a venv, and
+# `--active` aims that sync at the inherited VIRTUAL_ENV. Measured in a
+# throwaway repo: `uv run --active python -c "print('ran')"` from inside a
+# linked worktree reported "Uninstalled 1 package / Installed 1 package" and
+# moved the SHARED venv's .pth from <primary>/src to <worktree>/src. The same
+# command without `--active` left the shared venv untouched and built the
+# worktree's own .venv instead.
+#
+# These use their own platform-aware layout rather than `_session` above,
+# whose `bin`/`:` shape is POSIX-only.
+# --------------------------------------------------------------------------- #
+
+def _os_venv(root):
+    """A venv laid out the way THIS platform lays one out."""
+    venv = os.path.join(str(root), ".venv")
+    bindir = os.path.join(venv, "Scripts" if os.name == "nt" else "bin")
+    os.makedirs(bindir, exist_ok=True)
+    with open(os.path.join(venv, "pyvenv.cfg"), "w") as f:
+        f.write("home = /usr/bin\n")
+    for name in ("python", "pip", "uv"):
+        path = os.path.join(bindir, name + (".exe" if os.name == "nt" else ""))
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+    with open(os.path.join(str(root), "pyproject.toml"), "w") as f:
+        f.write("[project]\nname = \"x\"\n")
+    return os.path.realpath(str(root)), os.path.realpath(venv), bindir
+
+
+def _active_session(tmp_path):
+    primary, primary_venv, primary_bin = _os_venv(tmp_path / "primary")
+    wt, wt_venv, wt_bin = _os_venv(tmp_path / "wt")
+    prod_env = {
+        "PATH": primary_bin + os.pathsep + os.environ.get("PATH", ""),
+        "VIRTUAL_ENV": primary_venv,
+    }
+    return primary_venv, wt, wt_venv, wt_bin, prod_env
+
+
+def test_uv_run_active_into_the_shared_venv_is_denied(tmp_path):
+    """The incident itself, and note there is no install word in it."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        'uv run --active python -c "print(1)"',
+        "uv run --active ruff check .",
+        "uv run --active pytest -q",
+        "uv sync --active",
+        "uv pip install --active -e .",
+    ):
+        assert venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env), (
+            "must be denied, it rewrites the shared venv: %s" % cmd
+        )
+
+
+def test_the_same_commands_without_active_stay_allowed(tmp_path):
+    """The control that matters. This module's residual register records that
+    trusting the INHERITED VIRTUAL_ENV in general denied `uv sync` and
+    `uv run pytest -q` in every session, which is why it was not done. The
+    inherited value becomes a signal ONLY when `--active` says to use it, so
+    these must be untouched."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        'uv run python -c "print(1)"',
+        "uv run pytest -q",
+        "uv sync",
+        "uv run ruff check .",
+    ):
+        assert venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env) is None, (
+            "must stay allowed, it targets the worktree's own env: %s" % cmd
+        )
+
+
+def test_active_is_allowed_when_the_active_env_is_the_worktrees_own(tmp_path):
+    """`--active` is not itself the offence: pointing at your OWN venv is the
+    correct use, and the decision stays structural (where it writes) rather
+    than lexical (which flag it spells)."""
+    _pv, wt, wt_venv, wt_bin, _prod = _active_session(tmp_path)
+    own_env = {
+        "PATH": wt_bin + os.pathsep + os.environ.get("PATH", ""),
+        "VIRTUAL_ENV": wt_venv,
+    }
+    assert venv_install_guard.denial_reason(
+        "uv run --active pytest -q", cwd=wt, env=own_env) is None
+
+
+def test_active_equals_form_is_read_too(tmp_path):
+    """`--active=true` must not be a way around it."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    assert venv_install_guard.denial_reason(
+        "uv run --active=true pytest -q", cwd=wt, env=prod_env)
+
+
+def test_active_survives_the_shell_laundering_this_module_exists_for(tmp_path):
+    """The whole point of the module is that a nested shell does not hide the
+    command, so the new signal must survive the same laundering."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    assert venv_install_guard.denial_reason(
+        "bash -lc 'uv run --active pytest -q'", cwd=wt, env=prod_env)
+
+
+def test_active_in_an_unrelated_segment_is_not_the_installers_intent(tmp_path):
+    """`--active` reaches a process through THAT process's argv. Reading the
+    whole flat token stream instead denied commands that never touch the
+    shared venv, and the second of these is not hypothetical: a task working
+    on this very guard greps for the flag and then runs the suite on one line.
+
+    The stop condition is `_SEGMENT_BREAKS`, the same one `_mutating_subcommand`
+    walks to, so the two halves of "what did THIS invocation ask for" agree."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        # before the installer
+        "echo --active && uv run pytest -q",
+        "grep -- --active notes.txt && uv run pytest -q",
+        "grep -- --active notes.txt | uv run pytest -q",
+        "echo --active ; uv run pytest -q",
+        # AFTER it, in the next segment. `uv sync` and `uv add` invoke no
+        # program, so no positional stop is armed for them and the
+        # segment-break stop is the ONLY thing keeping this walk out of the
+        # next command's argv — deleting that line reddens this test.
+        "uv run pytest -q && echo --active",
+        "uv sync ; grep -- --active notes.txt",
+        "uv run pytest -q | grep -- --active",
+    ):
+        assert venv_install_guard.denial_reason(
+            cmd, cwd=wt, env=prod_env) is None, (
+            "the flag belongs to another segment's command, not to uv: %s" % cmd
+        )
+
+
+def test_a_flag_belonging_to_the_program_uv_runs_is_not_uvs_flag(tmp_path):
+    """`uv run <program> --active` gives the flag to <program>, not to uv, so
+    the walk stops at the program name — the second positional, the first
+    being uv's own subcommand.
+
+    Not hypothetical: this repository's OWN cli has `nh learnings --active`
+    (cli/commands.py), and a coder running it through `uv run` was denied with
+    an "install blocked" message about a venv the command never touches. A
+    false positive here costs a bounded attempt, so it is not free."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        "uv run nh learnings --active",
+        "uv run pytest -q --active",
+        'uv run pytest -q -k "--active"',
+    ):
+        assert venv_install_guard.denial_reason(
+            cmd, cwd=wt, env=prod_env) is None, (
+            "the flag belongs to the program uv invokes, not to uv: %s" % cmd
+        )
+
+
+def test_a_subcommand_that_invokes_nothing_has_no_program_to_stop_at(tmp_path):
+    """`uv add <pkg> --active` was ALLOWED, and it is the incident itself.
+
+    Only some installer subcommands go on to invoke a program: after `uv run`
+    the next positional is that program, and flags after it are the program's.
+    `uv add`, `uv sync`, `uv remove`, `uv lock` and `uv export` invoke nothing,
+    so every flag on the line is uv's own — treating their first ARGUMENT as a
+    program name stopped the walk one token early. Verified against uv 0.12.5:
+    `uv add <pkg> --active` really does put the worktree's editable `.pth`
+    into the shared venv.
+
+    The flag-first spellings are covered above; these are the trailing forms,
+    which is where the stop was wrong."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        "uv add iniconfig --active",
+        "uv remove iniconfig --active",
+        "uv export -o requirements.txt --active",
+        "uv add --extra dev iniconfig --active",
+        "bash -lc 'uv add iniconfig --active'",
+    ):
+        assert venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env), (
+            "this subcommand invokes no program, so --active is uv's: %s" % cmd
+        )
+
+
+def test_uvx_runs_its_first_positional_so_a_later_flag_is_the_programs(
+        tmp_path):
+    """`uvx` has no subcommand at all — its first positional IS the program,
+    so the stop sits one earlier than for `uv run`. Both directions pinned,
+    because getting this off by one is exactly the defect above."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    assert venv_install_guard.denial_reason(
+        "uvx --active ruff check .", cwd=wt, env=prod_env), "uvx's own flag"
+    assert venv_install_guard.denial_reason(
+        "uvx ruff --active", cwd=wt, env=prod_env) is None, (
+        "this --active belongs to ruff, not to uvx"
+    )
+
+
+def test_clearing_the_variable_on_the_command_line_beats_the_inherited_one(
+        tmp_path):
+    """`VIRTUAL_ENV= uv run --active pytest -q` is SAFE and appears in this
+    fleet's own history as a coder's workaround.
+
+    An assignment on the command line shadows the inherited value for the
+    child, so clearing it means there is no active environment to target and
+    uv falls back to the project's own. Denying it costs a bounded attempt for
+    nothing — the north-star cost of a false positive here is a failed task,
+    not an inconvenience. An assignment carrying a VALUE is picked up by the
+    existing scan and still counts."""
+    pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        "VIRTUAL_ENV= uv run --active pytest -q tests/test_x.py",
+        "VIRTUAL_ENV= UV_PROJECT_ENVIRONMENT= uv run --active pytest -q",
+    ):
+        assert venv_install_guard.denial_reason(
+            cmd, cwd=wt, env=prod_env) is None, (
+            "the command clears the variable, so nothing active is targeted: %s"
+            % cmd
+        )
+    assert venv_install_guard.denial_reason(
+        "VIRTUAL_ENV=%s uv run --active pytest -q" % pv,
+        cwd=wt, env=prod_env), "an assignment WITH a value still targets it"
+
+
+def test_a_flag_that_stops_the_sync_is_not_intent_to_write(tmp_path):
+    """`--no-sync` and `--no-project` NEGATE `--active`.
+
+    `uv run` syncs the project into its target environment before running
+    anything, and that sync is the only reason `--active` is intent at all.
+    With either flag the sync does not happen: measured against uv 0.12.5, the
+    shared venv's `.pth` is unchanged. They are also the MAJORITY spelling of
+    `--active` in this fleet's own coder traffic — 75 of 128 distinct real
+    commands — so denying them spends bounded attempts on commands that were
+    never a risk. A false denial here costs a failed task, not a nuisance."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        "uv run --active --no-sync pytest -q",
+        "uv run --no-sync --active pytest -q -n 4",
+        'uv run --active --no-project python -c "print(1)"',
+    ):
+        assert venv_install_guard.denial_reason(
+            cmd, cwd=wt, env=prod_env) is None, (
+            "this command does not sync, so it writes nothing: %s" % cmd
+        )
+    # The negation binds to ITS OWN invocation, not to the whole line.
+    assert venv_install_guard.denial_reason(
+        "uv run --no-sync --active pytest && uv run --active ruff check .",
+        cwd=wt, env=prod_env), "the second invocation still syncs"
+
+
+def test_the_suppression_binds_to_the_invocation_that_asked_for_active(
+        tmp_path):
+    """A `VIRTUAL_ENV=` prefix clears the variable for the command it
+    prefixes, and for nothing else. Taking the union across every installer on
+    the line let a DIFFERENT command's prefix disarm the denial — both of
+    these were allowed and both rewrite the shared venv at runtime."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        "VIRTUAL_ENV= uv sync && uv run --active pytest -q",
+        "VIRTUAL_ENV= uv run pytest && uv run --active ruff check .",
+    ):
+        assert venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env), (
+            "the prefix belongs to the first command, not the one asking for "
+            "the active env: %s" % cmd
+        )
+
+
+def test_only_the_installers_own_prefix_can_clear_the_variable(tmp_path):
+    """A shell assignment binds to the command it prefixes, and nothing else.
+
+    Scanning the whole flat token stream for `VAR=` let a token anywhere
+    suppress the one signal this module has for `--active` — including a token
+    that is merely an ARGUMENT to another command. All four of these were
+    allowed before the scan was scoped, and all four still reach the shared
+    venv at runtime. This is the suppression direction, so an error here is a
+    bypass rather than an over-denial."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        "echo VIRTUAL_ENV= && uv run --active pytest -q",
+        "uv run --active pytest -q VIRTUAL_ENV=",
+        "grep VIRTUAL_ENV= notes.txt ; uv run --active pytest -q",
+        "bash -lc 'echo VIRTUAL_ENV=' ; uv run --active pytest -q",
+        # the OTHER variable cleared, while VIRTUAL_ENV still points outside
+        "UV_PROJECT_ENVIRONMENT= uv run --active pytest -q",
+    ):
+        assert venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env), (
+            "no assignment prefixes THIS installer, so the inherited value "
+            "still applies: %s" % cmd
+        )
+    # `env` sits between the assignment and the installer, but no break does.
+    assert venv_install_guard.denial_reason(
+        "env VIRTUAL_ENV= uv run --active pytest -q",
+        cwd=wt, env=prod_env) is None, "an `env` prefix still clears it"
+
+
+def test_the_denial_names_the_fix_for_the_shape_that_triggers_it(tmp_path):
+    """A denial the coder cannot act on burns turns until the attempt dies.
+    `uv run --active pytest` is the shape this guard denies most often in
+    practice (measured in fleet history), and the message used to talk only
+    about `pip install` targets, which is not what that command was doing."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    reason = venv_install_guard.denial_reason(
+        "uv run --active pytest -q", cwd=wt, env=prod_env)
+    assert reason and "drop `--active`" in reason, (
+        "the message must name the actual remedy for this shape"
+    )
+
+
+def test_a_module_invocation_still_over_denies_and_that_is_recorded(tmp_path):
+    """KNOWN over-denial, pinned rather than fixed.
+
+    `python -m <module> <subcommand> --active` gives the flag to <module>, but
+    `python` is itself a resolved installer here and `-m`'s module name is not
+    the program name this walk counts, so only one positional precedes the
+    flag and it is read as intent. Modelling `-m` would mean teaching this
+    walk that a module is a program — real subtlety in a security guard, to
+    remove an over-denial on an uncommon spelling. Over-denial is the safe
+    direction, so this pins the behaviour instead of hiding it: if someone
+    later teaches the walk about `-m`, this test tells them they changed it."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    assert venv_install_guard.denial_reason(
+        "uv run python -m no_human.cli learnings --active",
+        cwd=wt, env=prod_env), "known over-denial: see this test's docstring"
+
+
+def test_an_unknown_flags_value_is_not_mistaken_for_the_program_name(tmp_path):
+    """The bypass the program-name stop opened, found by an independent
+    pre-merge review and verified against uv 0.12.5.
+
+    `_VALUE_FLAGS` is the set whose values this module needs to READ; uv has
+    many more value-taking flags than that. Counting the token after an
+    unrecognised flag as the program name stopped the walk before `--active`,
+    so `uv sync --extra dev --active` — which really does rewrite the shared
+    venv's editable `.pth`, the #128 mechanism verbatim — was ALLOWED."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        "uv sync --extra dev --active",
+        "uv run --extra dev --active pytest -q",
+        "uv run --group dev --active pytest -q",
+        "uv run --with ruff --active ruff check .",
+        "uv run --env-file .env --active pytest -q",
+        "uv run --index https://example.invalid --active pytest -q",
+        "uv add --optional dev --active foo",
+        "bash -lc 'uv run --with ruff --active pytest -q'",
+    ):
+        assert venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env), (
+            "uv receives --active here and would rewrite the shared venv: %s"
+            % cmd
+        )
+
+
+def test_the_flag_still_binds_to_uv_before_the_program_name(tmp_path):
+    """The control for the stop above: everything BEFORE the program name is
+    still uv's own argv, including after a value-taking flag and before `--`."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        "uv run --active pytest -q",
+        "uv --directory . run --active pytest",
+        "uv run --active -- pytest",
+        "uv sync --active",
+    ):
+        assert venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env), (
+            "uv itself receives --active here: %s" % cmd
+        )
+
+
+def test_active_after_the_installer_in_its_own_segment_is_still_caught(tmp_path):
+    """The control for the test above: scoping the walk must not cost the
+    incident itself, including when another segment runs first."""
+    _pv, wt, _wv, _wb, prod_env = _active_session(tmp_path)
+    for cmd in (
+        "echo hello && uv run --active pytest -q",
+        "uv run --active pytest -q && echo done",
+        "echo hello ; uv sync --active",
+    ):
+        assert venv_install_guard.denial_reason(cmd, cwd=wt, env=prod_env), (
+            "this invocation does pass --active and rewrites the shared venv: %s"
+            % cmd
+        )
